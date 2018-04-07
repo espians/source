@@ -1,29 +1,18 @@
-#include <stdio.h>
+#include "binding.h"
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
-#include "v8.h"
 #include "libplatform/libplatform.h"
-#include "binding.h"
+#include "v8.h"
 
 using namespace v8;
-
-class ArrayBufferAllocator : public ArrayBuffer::Allocator {
- public:
-  virtual void* Allocate(size_t length) {
-    void* data = AllocateUninitialized(length);
-    return data == NULL ? data : memset(data, 0, length);
-  }
-  virtual void* AllocateUninitialized(size_t length) { return malloc(length); }
-  virtual void Free(void* data, size_t) { free(data); }
-};
 
 struct worker_s {
   int x;
   int table_index;
   Isolate* isolate;
-  ArrayBufferAllocator allocator;
   std::string last_exception;
   Persistent<Function> recv;
   Persistent<Context> context;
@@ -36,10 +25,12 @@ const char* ToCString(const String::Utf8Value& value) {
 }
 
 // Exception details will be appended to the first argument.
-std::string ExceptionString(Isolate* isolate, TryCatch* try_catch) {
+std::string ExceptionString(Isolate* isolate,
+                            Local<Context> context,
+                            TryCatch* try_catch) {
   std::string out;
   size_t scratchSize = 20;
-  char scratch[scratchSize]; // just some scratch space for sprintf
+  char scratch[scratchSize];  // just some scratch space for sprintf
 
   HandleScope handle_scope(isolate);
   String::Utf8Value exception(try_catch->Exception());
@@ -71,12 +62,12 @@ std::string ExceptionString(Isolate* isolate, TryCatch* try_catch) {
     out.append(sourceline_string);
     out.append("\n");
 
-    // Print wavy underline (GetUnderline is deprecated).
-    int start = message->GetStartColumn();
+    // Print wavy underline.
+    int start = message->GetStartColumn(context).FromMaybe(0);
     for (int i = 0; i < start; i++) {
       out.append(" ");
     }
-    int end = message->GetEndColumn();
+    int end = message->GetEndColumn(context).FromMaybe(0);
     for (int i = start; i < end; i++) {
       out.append("^");
     }
@@ -93,7 +84,6 @@ std::string ExceptionString(Isolate* isolate, TryCatch* try_catch) {
   }
   return out;
 }
-
 
 extern "C" {
 #include "_cgo_export.h"
@@ -114,7 +104,7 @@ int worker_load(worker* w, char* name_s, char* source_s) {
   Local<Context> context = Local<Context>::New(w->isolate, w->context);
   Context::Scope context_scope(context);
 
-  TryCatch try_catch;
+  TryCatch try_catch(w->isolate);
 
   Local<String> name = String::NewFromUtf8(w->isolate, name_s);
   Local<String> source = String::NewFromUtf8(w->isolate, source_s);
@@ -125,7 +115,7 @@ int worker_load(worker* w, char* name_s, char* source_s) {
 
   if (script.IsEmpty()) {
     assert(try_catch.HasCaught());
-    w->last_exception = ExceptionString(w->isolate, &try_catch);
+    w->last_exception = ExceptionString(w->isolate, context, &try_catch);
     return 1;
   }
 
@@ -133,7 +123,7 @@ int worker_load(worker* w, char* name_s, char* source_s) {
 
   if (result.IsEmpty()) {
     assert(try_catch.HasCaught());
-    w->last_exception = ExceptionString(w->isolate, &try_catch);
+    w->last_exception = ExceptionString(w->isolate, context, &try_catch);
     return 2;
   }
 
@@ -219,7 +209,8 @@ void Send(const FunctionCallbackInfo<Value>& args) {
 }
 
 // Called from javascript using $request.
-// Must route message (string) to golang and send back message (string) as return value.
+// Must route message (string) to golang and send back message (string) as
+// return value.
 void SendSync(const FunctionCallbackInfo<Value>& args) {
   std::string msg;
   worker* w = NULL;
@@ -256,7 +247,7 @@ int worker_send(worker* w, const char* msg) {
   Local<Context> context = Local<Context>::New(w->isolate, w->context);
   Context::Scope context_scope(context);
 
-  TryCatch try_catch;
+  TryCatch try_catch(w->isolate);
 
   Local<Function> recv = Local<Function>::New(w->isolate, w->recv);
   if (recv.IsEmpty()) {
@@ -272,7 +263,7 @@ int worker_send(worker* w, const char* msg) {
   recv->Call(context->Global(), 1, args);
 
   if (try_catch.HasCaught()) {
-    w->last_exception = ExceptionString(w->isolate, &try_catch);
+    w->last_exception = ExceptionString(w->isolate, context, &try_catch);
     return 2;
   }
 
@@ -280,7 +271,8 @@ int worker_send(worker* w, const char* msg) {
 }
 
 // Called from golang. Must route message to javascript lang.
-// It will call the $recv_sync_handler callback function and return its string value.
+// It will call the $recv_sync_handler callback function and return its string
+// value.
 const char* worker_send_sync(worker* w, const char* msg) {
   std::string out;
   Locker locker(w->isolate);
@@ -290,7 +282,8 @@ const char* worker_send_sync(worker* w, const char* msg) {
   Local<Context> context = Local<Context>::New(w->isolate, w->context);
   Context::Scope context_scope(context);
 
-  Local<Function> recv_sync_handler = Local<Function>::New(w->isolate, w->recv_sync_handler);
+  Local<Function> recv_sync_handler =
+      Local<Function>::New(w->isolate, w->recv_sync_handler);
   if (recv_sync_handler.IsEmpty()) {
     out.append("err: $recvSync not called");
     return out.c_str();
@@ -298,7 +291,8 @@ const char* worker_send_sync(worker* w, const char* msg) {
 
   Local<Value> args[1];
   args[0] = String::NewFromUtf8(w->isolate, msg);
-  Local<Value> response_value = recv_sync_handler->Call(context->Global(), 1, args);
+  Local<Value> response_value =
+      recv_sync_handler->Call(context->Global(), 1, args);
 
   if (response_value->IsString()) {
     String::Utf8Value response(response_value->ToString());
@@ -309,20 +303,18 @@ const char* worker_send_sync(worker* w, const char* msg) {
   return out.c_str();
 }
 
-static ArrayBufferAllocator array_buffer_allocator;
-
 void v8_init() {
-  V8::InitializeICU();
   Platform* platform = platform::CreateDefaultPlatform();
   V8::InitializePlatform(platform);
   V8::Initialize();
 }
 
 worker* worker_new(int table_index) {
-  worker* w = new(worker);
+  worker* w = new (worker);
 
   Isolate::CreateParams create_params;
-  create_params.array_buffer_allocator = &w->allocator;
+  create_params.array_buffer_allocator =
+      ArrayBuffer::Allocator::NewDefaultAllocator();
   Isolate* isolate = Isolate::New(create_params);
   Locker locker(isolate);
   Isolate::Scope isolate_scope(isolate);
@@ -352,18 +344,16 @@ worker* worker_new(int table_index) {
 
   Local<Context> context = Context::New(w->isolate, NULL, global);
   w->context.Reset(w->isolate, context);
-  //context->Enter();
 
   return w;
 }
 
 void worker_dispose(worker* w) {
   w->isolate->Dispose();
-  delete(w);
+  delete (w);
 }
 
 void worker_terminate_execution(worker* w) {
-  V8::TerminateExecution(w->isolate);
+  w->isolate->TerminateExecution();
 }
-
 }
