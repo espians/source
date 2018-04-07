@@ -1,0 +1,9 @@
+# Third party licenses and the files they apply to.
+
+- type: MIT
+  license: doc/license/v8worker.txt
+  files:
+  - go/v8worker/binding.cc
+  - go/v8worker/binding.h
+  - go/v8worker/worker.go
+  - go/v8worker/worker_test.go
