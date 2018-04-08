@@ -155,7 +155,7 @@ func TestRequestFromGoReturningNonString(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := worker.SendSync("pang")
-	if got, want := response, "err: non-string return value"; got != want {
+	if got, want := response, "v8worker: non-string return value"; got != want {
 		t.Errorf("got %q want %q", got, want)
 	}
 }
@@ -190,7 +190,7 @@ func TestWorkerBreaking(t *testing.T) {
 
 	go func(w *Worker) {
 		time.Sleep(time.Second)
-		w.TerminateExecution()
+		w.Terminate()
 	}(worker)
 
 	worker.Load("forever.js", ` while (true) { ; } `)
@@ -206,13 +206,10 @@ func TestTightCreateLoop(t *testing.T) {
 
 func runSimpleWorker(t *testing.T) {
 	w := New(nil, nil)
-	defer w.Dispose()
-
 	err := w.Load("mytest.js", `
 	               // Do something
 	               var something = "Simple JavaScript";
 	       `)
-
 	if err != nil {
 		t.Fatal(err)
 	}

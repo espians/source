@@ -1,3 +1,4 @@
+// Package v8worker provides a minimalist binding to the V8 JavaScript engine.
 package v8worker
 
 /*
@@ -8,159 +9,133 @@ package v8worker
 #include "binding.h"
 */
 import "C"
-import "errors"
 
-import "unsafe"
-import "sync"
-import "runtime"
+import (
+	"errors"
+	"runtime"
+	"sync"
+	"unsafe"
+)
 
-type workerTableIndex int
+var mutex sync.Mutex
+var nextID = 0
+var once sync.Once
+var workers = make(map[int]*worker)
 
-var workerTableLock sync.Mutex
+// Callback handles messages received from $send calls from JavaScript.
+type Callback func(msg string)
 
-// This table will store all pointers to all active workers. Because we can't safely
-// pass pointers to Go objects to C, we instead pass a key to this table.
-var workerTable = make(map[workerTableIndex]*worker)
+// SyncCallback handles messages received from $sendSync calls from JavaScript
+// and passes the returned string back to JavaScript.
+type SyncCallback func(msg string) string
 
-// Keeps track of the last used table index. Incremeneted when a worker is created.
-var workerTableNextAvailable workerTableIndex = 0
-
-// To receive messages from javascript...
-type ReceiveMessageCallback func(msg string)
-
-// To send a message from javascript and synchronously return a string.
-type ReceiveSyncMessageCallback func(msg string) string
-
-// Don't init V8 more than once.
-var initV8Once sync.Once
-
-// Internal worker struct which is stored in the workerTable.
-// Weak-ref pattern https://groups.google.com/forum/#!topic/golang-nuts/1ItNOOj8yW8/discussion
+// Internal worker struct which is stored in the workers map using the weakref
+// pattern.
 type worker struct {
-	cWorker    *C.worker
-	cb         ReceiveMessageCallback
-	sync_cb    ReceiveSyncMessageCallback
-	tableIndex workerTableIndex
+	cb      Callback
+	cWorker *C.worker
+	id      int
+	syncCb  SyncCallback
 }
 
-// This is a golang wrapper around a single V8 Isolate.
+// Worker represents a single JavaScript VM instance.
 type Worker struct {
 	*worker
-	disposed bool
 }
 
-// Return the V8 version E.G. "4.3.59"
+// Version returns the V8 version, e.g. "6.6.346.19".
 func Version() string {
 	return C.GoString(C.worker_version())
 }
 
-func workerTableLookup(index workerTableIndex) *worker {
-	workerTableLock.Lock()
-	defer workerTableLock.Unlock()
-	return workerTable[index]
+// We use this indirection to get at active workers as we can't safely pass
+// pointers to Go objects to C.
+func getWorker(id int) *worker {
+	mutex.Lock()
+	defer mutex.Unlock()
+	return workers[id]
 }
 
 //export recvCb
-func recvCb(msg_s *C.char, index workerTableIndex) {
-	msg := C.GoString(msg_s)
-	w := workerTableLookup(index)
-	w.cb(msg)
+func recvCb(msg *C.char, id int) {
+	getWorker(id).cb(C.GoString(msg))
 }
 
 //export recvSyncCb
-func recvSyncCb(msg_s *C.char, index workerTableIndex) *C.char {
-	msg := C.GoString(msg_s)
-	w := workerTableLookup(index)
-	return_s := C.CString(w.sync_cb(msg))
-	return return_s
+func recvSyncCb(msg *C.char, id int) *C.char {
+	return C.CString(getWorker(id).syncCb(C.GoString(msg)))
 }
 
-// Creates a new worker, which corresponds to a V8 isolate. A single threaded
-// standalone execution context.
-func New(cb ReceiveMessageCallback, sync_cb ReceiveSyncMessageCallback) *Worker {
-	workerTableLock.Lock()
+// New initialises a new JavaScript VM instance.
+func New(cb Callback, syncCb SyncCallback) *Worker {
+	mutex.Lock()
+	nextID++
 	w := &worker{
-		cb:         cb,
-		sync_cb:    sync_cb,
-		tableIndex: workerTableNextAvailable,
+		cb:     cb,
+		syncCb: syncCb,
+		id:     nextID,
 	}
+	workers[nextID] = w
+	mutex.Unlock()
 
-	workerTableNextAvailable++
-	workerTable[w.tableIndex] = w
-	workerTableLock.Unlock()
-
-	initV8Once.Do(func() {
+	once.Do(func() {
 		C.v8_init()
 	})
 
-	w.cWorker = C.worker_new(C.int(w.tableIndex))
+	w.cWorker = C.worker_new(C.int(w.id))
 
-	externalWorker := &Worker{
-		worker:   w,
-		disposed: false,
-	}
-
-	runtime.SetFinalizer(externalWorker, func(final_worker *Worker) {
-		final_worker.Dispose()
+	wrapper := &Worker{w}
+	runtime.SetFinalizer(wrapper, func(w *Worker) {
+		w.dispose()
 	})
-	return externalWorker
+	return wrapper
 }
 
-// Forcefully frees up memory associated with worker.
-// GC will also free up worker memory so calling this isn't strictly necessary.
-func (w *Worker) Dispose() {
-	if w.disposed {
-		panic("worker already disposed")
-	}
-	w.disposed = true
-	workerTableLock.Lock()
-	internalWorker := w.worker
-	delete(workerTable, internalWorker.tableIndex)
-	workerTableLock.Unlock()
-	C.worker_dispose(internalWorker.cWorker)
+// Free resources associated with the worker and the underlying V8 Isolate.
+func (w *Worker) dispose() {
+	mutex.Lock()
+	delete(workers, w.worker.id)
+	mutex.Unlock()
+	C.worker_dispose(w.worker.cWorker)
 }
 
-// Load and executes a javascript file with the filename specified by
-// scriptName and the contents of the file specified by the param code.
-func (w *Worker) Load(scriptName string, code string) error {
-	scriptName_s := C.CString(scriptName)
-	code_s := C.CString(code)
-	defer C.free(unsafe.Pointer(scriptName_s))
-	defer C.free(unsafe.Pointer(code_s))
+// Load and execute JavaScript code with the given filename and source code.
+func (w *Worker) Load(filename string, source string) error {
+	filenameStr := C.CString(filename)
+	sourceStr := C.CString(source)
+	defer C.free(unsafe.Pointer(filenameStr))
+	defer C.free(unsafe.Pointer(sourceStr))
 
-	r := C.worker_load(w.worker.cWorker, scriptName_s, code_s)
+	r := C.worker_load(w.worker.cWorker, filenameStr, sourceStr)
 	if r != 0 {
-		errStr := C.GoString(C.worker_last_exception(w.worker.cWorker))
-		return errors.New(errStr)
+		err := C.GoString(C.worker_last_exception(w.worker.cWorker))
+		return errors.New(err)
 	}
 	return nil
 }
 
-// Sends a message to a worker. The $recv callback in js will be called.
+// Send a message, calling the $recv callback in JavaScript.
 func (w *Worker) Send(msg string) error {
-	msg_s := C.CString(string(msg))
-	defer C.free(unsafe.Pointer(msg_s))
+	msgStr := C.CString(msg)
+	defer C.free(unsafe.Pointer(msgStr))
 
-	r := C.worker_send(w.worker.cWorker, msg_s)
+	r := C.worker_send(w.worker.cWorker, msgStr)
 	if r != 0 {
-		errStr := C.GoString(C.worker_last_exception(w.worker.cWorker))
-		return errors.New(errStr)
+		err := C.GoString(C.worker_last_exception(w.worker.cWorker))
+		return errors.New(err)
 	}
-
 	return nil
 }
 
-// SendSync sends a message to a worker. The $recvSync callback in js will be called.
-// That callback will return a string which is passed to golang and used as the return value of SendSync.
+// SendSync sends a message, calling the $recvSync callback in JavaScript. The
+// return value of that callback will be passed back to the worker.
 func (w *Worker) SendSync(msg string) string {
-	msg_s := C.CString(string(msg))
-	defer C.free(unsafe.Pointer(msg_s))
-
-	svalue := C.worker_send_sync(w.worker.cWorker, msg_s)
-	return C.GoString(svalue)
+	msgStr := C.CString(msg)
+	defer C.free(unsafe.Pointer(msgStr))
+	return C.GoString(C.worker_send_sync(w.worker.cWorker, msgStr))
 }
 
-// Terminates execution of javascript
-func (w *Worker) TerminateExecution() {
+// Terminate forcefully stops the current thread of JavaScript execution.
+func (w *Worker) Terminate() {
 	C.worker_terminate_execution(w.worker.cWorker)
 }

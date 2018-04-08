@@ -10,8 +10,7 @@
 using namespace v8;
 
 struct worker_s {
-  int x;
-  int table_index;
+  int id;
   Isolate* isolate;
   std::string last_exception;
   Persistent<Function> recv;
@@ -19,18 +18,18 @@ struct worker_s {
   Persistent<Function> recv_sync_handler;
 };
 
-// Extracts a C string from a V8 Utf8Value.
+// ToCString extracts a C string from a V8 Utf8Value.
 const char* ToCString(const String::Utf8Value& value) {
-  return *value ? *value : "<string conversion failed>";
+  return *value ? *value : "<v8worker: string conversion failed>";
 }
 
-// Exception details will be appended to the first argument.
+// ExceptionString gathers details about the latest Exception.
 std::string ExceptionString(Isolate* isolate,
                             Local<Context> context,
                             TryCatch* try_catch) {
   std::string out;
   size_t scratchSize = 20;
-  char scratch[scratchSize];  // just some scratch space for sprintf
+  char scratch[scratchSize];
 
   HandleScope handle_scope(isolate);
   String::Utf8Value exception(try_catch->Exception());
@@ -88,8 +87,121 @@ std::string ExceptionString(Isolate* isolate,
 extern "C" {
 #include "_cgo_export.h"
 
-const char* worker_version() {
-  return V8::GetVersion();
+// The $print function.
+void Print(const FunctionCallbackInfo<Value>& args) {
+  bool first = true;
+  for (int i = 0; i < args.Length(); i++) {
+    HandleScope handle_scope(args.GetIsolate());
+    if (first) {
+      first = false;
+    } else {
+      printf(" ");
+    }
+    String::Utf8Value str(args[i]);
+    const char* cstr = ToCString(str);
+    printf("%s", cstr);
+  }
+  printf("\n");
+  fflush(stdout);
+}
+
+// The $recv function. Sets the given callback.
+void Recv(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  worker* w = (worker*)isolate->GetData(0);
+  assert(w->isolate == isolate);
+
+  HandleScope handle_scope(isolate);
+
+  Local<Context> context = Local<Context>::New(w->isolate, w->context);
+  Context::Scope context_scope(context);
+
+  Local<Value> v = args[0];
+  assert(v->IsFunction());
+  Local<Function> func = Local<Function>::Cast(v);
+
+  w->recv.Reset(isolate, func);
+}
+
+// The $recvSync function. Sets the given callback.
+void RecvSync(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  worker* w = (worker*)isolate->GetData(0);
+  assert(w->isolate == isolate);
+
+  HandleScope handle_scope(isolate);
+
+  Local<Context> context = Local<Context>::New(w->isolate, w->context);
+  Context::Scope context_scope(context);
+
+  Local<Value> v = args[0];
+  assert(v->IsFunction());
+  Local<Function> func = Local<Function>::Cast(v);
+
+  w->recv_sync_handler.Reset(isolate, func);
+}
+
+// The $send function. Calls the corresponding worker's Callback in Go.
+void Send(const FunctionCallbackInfo<Value>& args) {
+  std::string msg;
+  worker* w = NULL;
+  {
+    Isolate* isolate = args.GetIsolate();
+    w = static_cast<worker*>(isolate->GetData(0));
+    assert(w->isolate == isolate);
+
+    Locker locker(w->isolate);
+    HandleScope handle_scope(isolate);
+
+    Local<Context> context = Local<Context>::New(w->isolate, w->context);
+    Context::Scope context_scope(context);
+
+    Local<Value> v = args[0];
+    assert(v->IsString());
+
+    String::Utf8Value str(v);
+    msg = ToCString(str);
+  }
+  // TODO(tav): should we use Unlocker?
+  recvCb((char*)msg.c_str(), w->id);
+}
+
+// The $sendSync function. Calls the corresponding worker's SyncCallback in Go.
+void SendSync(const FunctionCallbackInfo<Value>& args) {
+  std::string msg;
+  worker* w = NULL;
+  {
+    Isolate* isolate = args.GetIsolate();
+    w = static_cast<worker*>(isolate->GetData(0));
+    assert(w->isolate == isolate);
+
+    Locker locker(w->isolate);
+    HandleScope handle_scope(isolate);
+
+    Local<Context> context = Local<Context>::New(w->isolate, w->context);
+    Context::Scope context_scope(context);
+
+    Local<Value> v = args[0];
+    assert(v->IsString());
+
+    String::Utf8Value str(v);
+    msg = ToCString(str);
+  }
+  char* returnMsg = recvSyncCb((char*)msg.c_str(), w->id);
+  Local<String> returnV = String::NewFromUtf8(w->isolate, returnMsg);
+  args.GetReturnValue().Set(returnV);
+  free(returnMsg);
+}
+
+void v8_init() {
+  Platform* platform = platform::CreateDefaultPlatform();
+  V8::InitializePlatform(platform);
+  V8::Initialize();
+}
+
+void worker_dispose(worker* w) {
+  w->isolate->Dispose();
+  delete (w);
 }
 
 const char* worker_last_exception(worker* w) {
@@ -130,186 +242,7 @@ int worker_load(worker* w, char* name_s, char* source_s) {
   return 0;
 }
 
-void Print(const FunctionCallbackInfo<Value>& args) {
-  bool first = true;
-  for (int i = 0; i < args.Length(); i++) {
-    HandleScope handle_scope(args.GetIsolate());
-    if (first) {
-      first = false;
-    } else {
-      printf(" ");
-    }
-    String::Utf8Value str(args[i]);
-    const char* cstr = ToCString(str);
-    printf("%s", cstr);
-  }
-  printf("\n");
-  fflush(stdout);
-}
-
-// sets the recv callback.
-void Recv(const FunctionCallbackInfo<Value>& args) {
-  Isolate* isolate = args.GetIsolate();
-  worker* w = (worker*)isolate->GetData(0);
-  assert(w->isolate == isolate);
-
-  HandleScope handle_scope(isolate);
-
-  Local<Context> context = Local<Context>::New(w->isolate, w->context);
-  Context::Scope context_scope(context);
-
-  Local<Value> v = args[0];
-  assert(v->IsFunction());
-  Local<Function> func = Local<Function>::Cast(v);
-
-  w->recv.Reset(isolate, func);
-}
-
-void RecvSync(const FunctionCallbackInfo<Value>& args) {
-  Isolate* isolate = args.GetIsolate();
-  worker* w = (worker*)isolate->GetData(0);
-  assert(w->isolate == isolate);
-
-  HandleScope handle_scope(isolate);
-
-  Local<Context> context = Local<Context>::New(w->isolate, w->context);
-  Context::Scope context_scope(context);
-
-  Local<Value> v = args[0];
-  assert(v->IsFunction());
-  Local<Function> func = Local<Function>::Cast(v);
-
-  w->recv_sync_handler.Reset(isolate, func);
-}
-
-// Called from javascript. Must route message to golang.
-void Send(const FunctionCallbackInfo<Value>& args) {
-  std::string msg;
-  worker* w = NULL;
-  {
-    Isolate* isolate = args.GetIsolate();
-    w = static_cast<worker*>(isolate->GetData(0));
-    assert(w->isolate == isolate);
-
-    Locker locker(w->isolate);
-    HandleScope handle_scope(isolate);
-
-    Local<Context> context = Local<Context>::New(w->isolate, w->context);
-    Context::Scope context_scope(context);
-
-    Local<Value> v = args[0];
-    assert(v->IsString());
-
-    String::Utf8Value str(v);
-    msg = ToCString(str);
-  }
-
-  // XXX should we use Unlocker?
-  recvCb((char*)msg.c_str(), w->table_index);
-}
-
-// Called from javascript using $request.
-// Must route message (string) to golang and send back message (string) as
-// return value.
-void SendSync(const FunctionCallbackInfo<Value>& args) {
-  std::string msg;
-  worker* w = NULL;
-  {
-    Isolate* isolate = args.GetIsolate();
-    w = static_cast<worker*>(isolate->GetData(0));
-    assert(w->isolate == isolate);
-
-    Locker locker(w->isolate);
-    HandleScope handle_scope(isolate);
-
-    Local<Context> context = Local<Context>::New(w->isolate, w->context);
-    Context::Scope context_scope(context);
-
-    Local<Value> v = args[0];
-    assert(v->IsString());
-
-    String::Utf8Value str(v);
-    msg = ToCString(str);
-  }
-  char* returnMsg = recvSyncCb((char*)msg.c_str(), w->table_index);
-  Local<String> returnV = String::NewFromUtf8(w->isolate, returnMsg);
-  args.GetReturnValue().Set(returnV);
-  free(returnMsg);
-}
-
-// Called from golang. Must route message to javascript lang.
-// non-zero return value indicates error. check worker_last_exception().
-int worker_send(worker* w, const char* msg) {
-  Locker locker(w->isolate);
-  Isolate::Scope isolate_scope(w->isolate);
-  HandleScope handle_scope(w->isolate);
-
-  Local<Context> context = Local<Context>::New(w->isolate, w->context);
-  Context::Scope context_scope(context);
-
-  TryCatch try_catch(w->isolate);
-
-  Local<Function> recv = Local<Function>::New(w->isolate, w->recv);
-  if (recv.IsEmpty()) {
-    w->last_exception = "$recv not called";
-    return 1;
-  }
-
-  Local<Value> args[1];
-  args[0] = String::NewFromUtf8(w->isolate, msg);
-
-  assert(!try_catch.HasCaught());
-
-  recv->Call(context->Global(), 1, args);
-
-  if (try_catch.HasCaught()) {
-    w->last_exception = ExceptionString(w->isolate, context, &try_catch);
-    return 2;
-  }
-
-  return 0;
-}
-
-// Called from golang. Must route message to javascript lang.
-// It will call the $recv_sync_handler callback function and return its string
-// value.
-const char* worker_send_sync(worker* w, const char* msg) {
-  std::string out;
-  Locker locker(w->isolate);
-  Isolate::Scope isolate_scope(w->isolate);
-  HandleScope handle_scope(w->isolate);
-
-  Local<Context> context = Local<Context>::New(w->isolate, w->context);
-  Context::Scope context_scope(context);
-
-  Local<Function> recv_sync_handler =
-      Local<Function>::New(w->isolate, w->recv_sync_handler);
-  if (recv_sync_handler.IsEmpty()) {
-    out.append("err: $recvSync not called");
-    return out.c_str();
-  }
-
-  Local<Value> args[1];
-  args[0] = String::NewFromUtf8(w->isolate, msg);
-  Local<Value> response_value =
-      recv_sync_handler->Call(context->Global(), 1, args);
-
-  if (response_value->IsString()) {
-    String::Utf8Value response(response_value->ToString());
-    out.append(*response);
-  } else {
-    out.append("err: non-string return value");
-  }
-  return out.c_str();
-}
-
-void v8_init() {
-  Platform* platform = platform::CreateDefaultPlatform();
-  V8::InitializePlatform(platform);
-  V8::Initialize();
-}
-
-worker* worker_new(int table_index) {
+worker* worker_new(int id) {
   worker* w = new (worker);
 
   Isolate::CreateParams create_params;
@@ -323,7 +256,7 @@ worker* worker_new(int table_index) {
   w->isolate = isolate;
   w->isolate->SetCaptureStackTraceForUncaughtExceptions(true);
   w->isolate->SetData(0, w);
-  w->table_index = table_index;
+  w->id = id;
 
   Local<ObjectTemplate> global = ObjectTemplate::New(w->isolate);
 
@@ -348,12 +281,77 @@ worker* worker_new(int table_index) {
   return w;
 }
 
-void worker_dispose(worker* w) {
-  w->isolate->Dispose();
-  delete (w);
+// Called from Go to send messages to JavaScript. It will call the callback
+// registered with $recv. A non-zero return value indicates error. Check
+// worker_last_exception().
+int worker_send(worker* w, const char* msg) {
+  Locker locker(w->isolate);
+  Isolate::Scope isolate_scope(w->isolate);
+  HandleScope handle_scope(w->isolate);
+
+  Local<Context> context = Local<Context>::New(w->isolate, w->context);
+  Context::Scope context_scope(context);
+
+  TryCatch try_catch(w->isolate);
+
+  Local<Function> recv = Local<Function>::New(w->isolate, w->recv);
+  if (recv.IsEmpty()) {
+    w->last_exception = "v8worker: callback not registered with $recv";
+    return 1;
+  }
+
+  Local<Value> args[1];
+  args[0] = String::NewFromUtf8(w->isolate, msg);
+
+  assert(!try_catch.HasCaught());
+
+  recv->Call(context->Global(), 1, args);
+
+  if (try_catch.HasCaught()) {
+    w->last_exception = ExceptionString(w->isolate, context, &try_catch);
+    return 2;
+  }
+
+  return 0;
+}
+
+// Called from Go to send messages to JavaScript. It will call the callback
+// registered with $recvSync and return its string value.
+const char* worker_send_sync(worker* w, const char* msg) {
+  std::string out;
+  Locker locker(w->isolate);
+  Isolate::Scope isolate_scope(w->isolate);
+  HandleScope handle_scope(w->isolate);
+
+  Local<Context> context = Local<Context>::New(w->isolate, w->context);
+  Context::Scope context_scope(context);
+
+  Local<Function> recv_sync_handler =
+      Local<Function>::New(w->isolate, w->recv_sync_handler);
+  if (recv_sync_handler.IsEmpty()) {
+    out.append("v8worker: callback not registered with $recvSync");
+    return out.c_str();
+  }
+
+  Local<Value> args[1];
+  args[0] = String::NewFromUtf8(w->isolate, msg);
+  Local<Value> response_value =
+      recv_sync_handler->Call(context->Global(), 1, args);
+
+  if (response_value->IsString()) {
+    String::Utf8Value response(response_value->ToString());
+    out.append(*response);
+  } else {
+    out.append("v8worker: non-string return value");
+  }
+  return out.c_str();
 }
 
 void worker_terminate_execution(worker* w) {
   w->isolate->TerminateExecution();
+}
+
+const char* worker_version() {
+  return V8::GetVersion();
 }
 }
