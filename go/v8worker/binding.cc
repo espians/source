@@ -18,6 +18,13 @@ struct worker_s {
   Persistent<Function> recv_sync_handler;
 };
 
+// CopyString converts a std::string to a C string.
+const char* CopyString(const std::string& value) {
+  char* c = (char*)malloc(value.length());
+  strcpy(c, value.c_str());
+  return c;
+}
+
 // ToCString extracts a C string from a V8 Utf8Value.
 const char* ToCString(const String::Utf8Value& value) {
   return *value ? *value : "<v8worker: string conversion failed>";
@@ -205,7 +212,7 @@ void worker_dispose(worker* w) {
 }
 
 const char* worker_last_exception(worker* w) {
-  return w->last_exception.c_str();
+  return CopyString(w->last_exception);
 }
 
 int worker_load(worker* w, char* name_s, char* source_s) {
@@ -330,7 +337,7 @@ const char* worker_send_sync(worker* w, const char* msg) {
       Local<Function>::New(w->isolate, w->recv_sync_handler);
   if (recv_sync_handler.IsEmpty()) {
     out.append("v8worker: callback not registered with $recvSync");
-    return out.c_str();
+    return CopyString(out);
   }
 
   Local<Value> args[1];
@@ -344,7 +351,7 @@ const char* worker_send_sync(worker* w, const char* msg) {
   } else {
     out.append("v8worker: non-string return value");
   }
-  return out.c_str();
+  return CopyString(out);
 }
 
 void worker_terminate_execution(worker* w) {

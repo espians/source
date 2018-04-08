@@ -18,15 +18,15 @@ import (
 )
 
 var mutex sync.Mutex
-var nextID = 0
+var nextID int32
 var once sync.Once
-var workers = make(map[int]*worker)
+var workers = make(map[int32]*worker)
 
 // Callback handles messages received from $send calls from JavaScript.
 type Callback func(msg string)
 
-// SyncCallback handles messages received from $sendSync calls from JavaScript
-// and passes the returned string back to JavaScript.
+// SyncCallback handles messages received from $sendSync calls from JavaScript.
+// Its return value is passed back to JavaScript.
 type SyncCallback func(msg string) string
 
 // Internal worker struct which is stored in the workers map using the weakref
@@ -34,12 +34,13 @@ type SyncCallback func(msg string) string
 type worker struct {
 	cb      Callback
 	cWorker *C.worker
-	id      int
+	id      int32
 	syncCb  SyncCallback
 }
 
-// Worker represents a single JavaScript VM instance.
-type Worker struct {
+// Instance represents a single JavaScript VM instance.
+type Instance struct {
+	sync.Mutex
 	*worker
 }
 
@@ -50,24 +51,24 @@ func Version() string {
 
 // We use this indirection to get at active workers as we can't safely pass
 // pointers to Go objects to C.
-func getWorker(id int) *worker {
+func getWorker(id int32) *worker {
 	mutex.Lock()
 	defer mutex.Unlock()
 	return workers[id]
 }
 
 //export recvCb
-func recvCb(msg *C.char, id int) {
+func recvCb(msg *C.char, id int32) {
 	getWorker(id).cb(C.GoString(msg))
 }
 
 //export recvSyncCb
-func recvSyncCb(msg *C.char, id int) *C.char {
+func recvSyncCb(msg *C.char, id int32) *C.char {
 	return C.CString(getWorker(id).syncCb(C.GoString(msg)))
 }
 
 // New initialises a new JavaScript VM instance.
-func New(cb Callback, syncCb SyncCallback) *Worker {
+func New(cb Callback, syncCb SyncCallback) *Instance {
 	mutex.Lock()
 	nextID++
 	w := &worker{
@@ -84,58 +85,78 @@ func New(cb Callback, syncCb SyncCallback) *Worker {
 
 	w.cWorker = C.worker_new(C.int(w.id))
 
-	wrapper := &Worker{w}
-	runtime.SetFinalizer(wrapper, func(w *Worker) {
+	i := &Instance{worker: w}
+	runtime.SetFinalizer(i, func(w *Instance) {
 		w.dispose()
 	})
-	return wrapper
+	return i
 }
 
-// Free resources associated with the worker and the underlying V8 Isolate.
-func (w *Worker) dispose() {
+// Free resources associated with the underlying worker and V8 Isolate.
+func (i *Instance) dispose() {
 	mutex.Lock()
-	delete(workers, w.worker.id)
+	delete(workers, i.worker.id)
 	mutex.Unlock()
-	C.worker_dispose(w.worker.cWorker)
+	C.worker_dispose(i.worker.cWorker)
+}
+
+func (i *Instance) getError() error {
+	err := C.worker_last_exception(i.worker.cWorker)
+	defer C.free(unsafe.Pointer(err))
+	return errors.New(C.GoString(err))
 }
 
 // Load and execute JavaScript code with the given filename and source code.
-func (w *Worker) Load(filename string, source string) error {
+func (i *Instance) Load(filename string, source string) error {
+	i.Lock()
+	defer i.Unlock()
+
 	filenameStr := C.CString(filename)
 	sourceStr := C.CString(source)
 	defer C.free(unsafe.Pointer(filenameStr))
 	defer C.free(unsafe.Pointer(sourceStr))
 
-	r := C.worker_load(w.worker.cWorker, filenameStr, sourceStr)
+	r := C.worker_load(i.worker.cWorker, filenameStr, sourceStr)
 	if r != 0 {
-		err := C.GoString(C.worker_last_exception(w.worker.cWorker))
-		return errors.New(err)
+		return i.getError()
 	}
 	return nil
 }
 
 // Send a message, calling the $recv callback in JavaScript.
-func (w *Worker) Send(msg string) error {
+func (i *Instance) Send(msg string) error {
+	i.Lock()
+	defer i.Unlock()
+
 	msgStr := C.CString(msg)
 	defer C.free(unsafe.Pointer(msgStr))
 
-	r := C.worker_send(w.worker.cWorker, msgStr)
+	r := C.worker_send(i.worker.cWorker, msgStr)
 	if r != 0 {
-		err := C.GoString(C.worker_last_exception(w.worker.cWorker))
-		return errors.New(err)
+		return i.getError()
 	}
 	return nil
 }
 
 // SendSync sends a message, calling the $recvSync callback in JavaScript. The
-// return value of that callback will be passed back to the worker.
-func (w *Worker) SendSync(msg string) string {
+// return value of that callback will be passed back to the caller in Go.
+func (i *Instance) SendSync(msg string) string {
+	i.Lock()
+	defer i.Unlock()
+
 	msgStr := C.CString(msg)
 	defer C.free(unsafe.Pointer(msgStr))
-	return C.GoString(C.worker_send_sync(w.worker.cWorker, msgStr))
+
+	resp := C.worker_send_sync(i.worker.cWorker, msgStr)
+	defer C.free(unsafe.Pointer(resp))
+
+	return C.GoString(resp)
 }
 
 // Terminate forcefully stops the current thread of JavaScript execution.
-func (w *Worker) Terminate() {
-	C.worker_terminate_execution(w.worker.cWorker)
+func (i *Instance) Terminate() {
+	i.Lock()
+	defer i.Unlock()
+
+	C.worker_terminate_execution(i.worker.cWorker)
 }

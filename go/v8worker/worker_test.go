@@ -188,7 +188,7 @@ func TestWorkerBreaking(t *testing.T) {
 		println("recv cb", msg)
 	}, DiscardSendSync)
 
-	go func(w *Worker) {
+	go func(w *Instance) {
 		time.Sleep(time.Second)
 		w.Terminate()
 	}(worker)
