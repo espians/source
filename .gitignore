@@ -1,6 +1,21 @@
 # Public Domain (-) 2018-present, The Espian Source Authors.
 # See the Espian Source UNLICENSE file for details.
 
+# Specific paths
+
+/go/v8worker/build/
+/go/v8worker/distfile/
+/go/v8worker/include/
+/go/v8worker/lib/
+/go/v8worker/scripts.tar
+
 # Hidden files/directories
 
 .DS_Store
+
+# File patterns
+
+*.a
+*.o
+*.pyc
+*.pyo
