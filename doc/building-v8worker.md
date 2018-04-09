@@ -45,25 +45,32 @@ Finally, build `v8`:
 
     ninja -C out.gn/x64.release
 
-Create the appropriate subdirectories within the `v8worker` directory:
+Create the appropriate subdirectories within the `v8worker` directory for the
+current `platform`, i.e. the operating system you are building on:
 
     mkdir -p <v8worker-path>/include/libplatform
     mkdir -p <v8worker-path>/lib/<platform>.x64
 
-Copy over the header and compiled files:
+For example:
+
+    mkdir -p <v8worker-path>/include/libplatform
+    mkdir -p <v8worker-path>/lib/darwin.x64
+
+Currently only `x64` on `darwin` and `linux` are supported. Other platforms
+supported by V8 can be easily added by extending the cgo preamble in
+`v8worker/worker.go`.
+
+And, finally, copy over the header and compiled files:
 
     cp include/*.h <v8worker-path>/include
     cp include/libplatform/*.h <v8worker-path>/include/libplatform/
     cp out.gn/x64.release/obj/libv8_*.a <v8worker-path>/lib/<platform>.x64
 
-Currently only `darwin` and `linux` platforms are supported. But others can be
-added fairly easily.
-
 ## Building v8worker
 
 You are now all set to build executables that depend on `v8worker`.
 
-One aspect to note on macOS, is the [pending issue] on the slowness of combining
+One aspect to note on macOS is the [pending issue] on the slowness of combining
 the DWARF debug info. You can speed things up by instructing the linker to omit
 the symbol table and debug info during builds:
 
