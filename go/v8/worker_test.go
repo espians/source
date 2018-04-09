@@ -1,4 +1,4 @@
-package v8worker
+package v8
 
 import (
 	"runtime"
@@ -188,7 +188,7 @@ func TestWorkerBreaking(t *testing.T) {
 		println("recv cb", msg)
 	}, DiscardSendSync)
 
-	go func(w *Instance) {
+	go func(w *Worker) {
 		time.Sleep(time.Second)
 		w.Terminate()
 	}(worker)
