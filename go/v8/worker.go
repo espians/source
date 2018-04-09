@@ -1,4 +1,7 @@
 // Package v8 provides a minimalist binding to the V8 JavaScript engine.
+//
+// The LoadModule and LoadScript methods are not threadsafe. It is up to callers
+// to ensure that they are not called concurrently on the same Worker.
 package v8
 
 /*
@@ -32,9 +35,28 @@ type instance struct {
 }
 
 // Worker represents a single JavaScript VM instance.
+//
+// The various configuration options must be set before any of that Worker's
+// methods are called. Once one of its methods has been called, the Worker will
+// no longer pay any attention to changes in the configuration options.
 type Worker struct {
 	instance *instance
 	mutex    sync.Mutex
+
+	// GetModuleSource is used to get
+	GetModuleSource func(url string) string
+
+	// HandleSend handles messages received from js.send calls. If it is nil,
+	// then an exception will be raised to the caller.
+	HandleSend func(msg string)
+
+	// HandleSendSync handles messages received from js.sendSync calls. Its
+	// return value will be passed back to the caller in JavaScript. If
+	// HandleSendSync is nil, then an exception will be raised to the caller.
+	HandleSendSync func(msg string) (response string)
+
+	// ResolveModuleURL
+	ResolveModuleURL func(url string, context string) string
 }
 
 // Version returns the V8 version, e.g. "6.6.346.19".
@@ -52,46 +74,22 @@ func getInstance(id int32) *instance {
 
 //export recvCb
 func recvCb(msg *C.char, id int32) {
-	getInstance(id).cb(C.GoString(msg))
+	cb := getInstance(id).cb
+	if cb != nil {
+		cb(C.GoString(msg))
+	}
 }
 
 //export recvSyncCb
 func recvSyncCb(msg *C.char, id int32) *C.char {
-	return C.CString(getInstance(id).syncCb(C.GoString(msg)))
-}
-
-// New initialises a new JavaScript VM instance. It takes two parameters
-// defining callback handlers for messages sent from JavaScript.
-//
-// The first callback handles messages received from $send calls from
-// JavaScript.
-//
-// The second callback handles messages received from $sendSync calls from
-// JavaScript. Its return value will be passed back to the caller in JavaScript.
-func New(cb func(string), syncCb func(string) string) *Worker {
-	mutex.Lock()
-	nextID++
-	i := &instance{
-		cb:     cb,
-		id:     nextID,
-		syncCb: syncCb,
+	syncCb := getInstance(id).syncCb
+	var resp string
+	if syncCb == nil {
+		resp = "v8: Worker.HandleSendSync is nil"
+	} else {
+		resp = syncCb(C.GoString(msg))
 	}
-	registry[nextID] = i
-	mutex.Unlock()
-
-	once.Do(func() {
-		C.v8_init()
-	})
-
-	i.worker = C.worker_new(C.int(i.id))
-
-	w := &Worker{
-		instance: i,
-	}
-	runtime.SetFinalizer(w, func(w *Worker) {
-		w.dispose()
-	})
-	return w
+	return C.CString(resp)
 }
 
 // Free resources associated with the underlying worker and V8 Isolate.
@@ -102,23 +100,73 @@ func (w *Worker) dispose() {
 	C.worker_dispose(w.instance.worker)
 }
 
+// Convert the last exception into a Go value.
 func (w *Worker) getError() error {
 	err := C.worker_last_exception(w.instance.worker)
 	defer C.free(unsafe.Pointer(err))
 	return errors.New(C.GoString(err))
 }
 
-// Load and execute JavaScript code with the given filename and source code.
-// Each Worker can only handle a single Load call at a time. It is up to the
-// caller to ensure that multiple threads don't call Load on the same Worker at
-// the same time.
-func (w *Worker) Load(filename string, source string) error {
+// Initialise the underlying JavaScript VM instance.
+func (w *Worker) init() {
+	if w.instance != nil {
+		return
+	}
+
+	mutex.Lock()
+	nextID++
+	i := &instance{
+		cb:     w.HandleSend,
+		id:     nextID,
+		syncCb: w.HandleSendSync,
+	}
+	registry[nextID] = i
+	mutex.Unlock()
+
+	once.Do(func() {
+		C.v8_init()
+	})
+
+	i.worker = C.worker_new(C.int(i.id))
+	w.instance = i
+
+	runtime.SetFinalizer(w, func(w *Worker) {
+		w.dispose()
+	})
+}
+
+// LoadModule loads and executes JavaScript ES Module code with the given
+// filename and source code. LoadModule is not threadsafe.
+func (w *Worker) LoadModule(url string, source string) error {
+	w.mutex.Lock()
+	w.init()
+	w.mutex.Unlock()
+
+	urlStr := C.CString(url)
+	sourceStr := C.CString(source)
+	defer C.free(unsafe.Pointer(urlStr))
+	defer C.free(unsafe.Pointer(sourceStr))
+
+	r := C.worker_load_module(w.instance.worker, urlStr, sourceStr)
+	if r != 0 {
+		return w.getError()
+	}
+	return nil
+}
+
+// LoadScript loads and executes JavaScript code with the given filename and
+// source code. LoadScript is not threadsafe.
+func (w *Worker) LoadScript(filename string, source string) error {
+	w.mutex.Lock()
+	w.init()
+	w.mutex.Unlock()
+
 	filenameStr := C.CString(filename)
 	sourceStr := C.CString(source)
 	defer C.free(unsafe.Pointer(filenameStr))
 	defer C.free(unsafe.Pointer(sourceStr))
 
-	r := C.worker_load(w.instance.worker, filenameStr, sourceStr)
+	r := C.worker_load_script(w.instance.worker, filenameStr, sourceStr)
 	if r != 0 {
 		return w.getError()
 	}
@@ -130,6 +178,7 @@ func (w *Worker) Send(msg string) error {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
 
+	w.init()
 	msgStr := C.CString(msg)
 	defer C.free(unsafe.Pointer(msgStr))
 
@@ -146,6 +195,7 @@ func (w *Worker) SendSync(msg string) string {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
 
+	w.init()
 	msgStr := C.CString(msg)
 	defer C.free(unsafe.Pointer(msgStr))
 
@@ -155,10 +205,15 @@ func (w *Worker) SendSync(msg string) string {
 	return C.GoString(resp)
 }
 
-// Terminate forcefully stops the current thread of JavaScript execution.
+// Terminate instructs the underlying JavaScript VM to stop its current thread
+// of execution. The instruction will cause the VM to stop at the next available
+// opportunity.
 func (w *Worker) Terminate() {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
 
-	C.worker_terminate_execution(w.instance.worker)
+	// Don't bother if we haven't yet been initialised.
+	if w.instance != nil {
+		C.worker_terminate_execution(w.instance.worker)
+	}
 }
