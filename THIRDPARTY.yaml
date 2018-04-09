@@ -3,7 +3,7 @@
 - type: MIT
   license: doc/license/v8worker.txt
   files:
-  - go/v8worker/binding.cc
-  - go/v8worker/binding.h
-  - go/v8worker/worker.go
-  - go/v8worker/worker_test.go
+    - go/v8/binding.cc
+    - go/v8/binding.h
+    - go/v8/worker.go
+    - go/v8/worker_test.go
