@@ -107,10 +107,10 @@ func (i *Instance) getError() error {
 }
 
 // Load and execute JavaScript code with the given filename and source code.
+// Each Instance can only handle a single Load call at a time. It is up to the
+// caller to ensure that multiple threads don't call Load on the same Instance
+// at the same time.
 func (i *Instance) Load(filename string, source string) error {
-	i.Lock()
-	defer i.Unlock()
-
 	filenameStr := C.CString(filename)
 	sourceStr := C.CString(source)
 	defer C.free(unsafe.Pointer(filenameStr))
