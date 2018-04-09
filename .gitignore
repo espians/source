@@ -3,11 +3,11 @@
 
 # Specific paths
 
-/go/v8worker/build/
-/go/v8worker/distfile/
-/go/v8worker/include/
-/go/v8worker/lib/
-/go/v8worker/scripts.tar
+/go/v8/build/
+/go/v8/distfile/
+/go/v8/include/
+/go/v8/lib/
+/go/v8/scripts.tar
 
 # Hidden files/directories
 
