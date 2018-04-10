@@ -15,6 +15,9 @@
 
 # File patterns
 
+_cgo_export.h
+_obj/
+
 *.a
 *.o
 *.pyc
