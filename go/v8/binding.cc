@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include <unordered_map>
 #include "libplatform/libplatform.h"
 #include "v8.h"
 
@@ -18,6 +19,29 @@ struct worker_s {
   Persistent<Function> recv_sync_handler;
 };
 
+// Per-context Module data, allowing sharing of module maps across top-level
+// module loads. Adapted from V8's source.
+class ModuleData {
+ private:
+  class ModuleHash {
+   public:
+    explicit ModuleHash(Isolate* isolate) : isolate_(isolate) {}
+    size_t operator()(const Global<Module>& module) const {
+      return module.Get(isolate_)->GetIdentityHash();
+    }
+
+   private:
+    Isolate* isolate_;
+  };
+
+ public:
+  explicit ModuleData(Isolate* isolate)
+      : module_to_url_map(10, ModuleHash(isolate)) {}
+
+  std::unordered_map<std::string, Global<Module>> url_to_module_map;
+  std::unordered_map<Global<Module>, std::string, ModuleHash> module_to_url_map;
+};
+
 // CopyString converts a std::string to a C string.
 const char* CopyString(const std::string& value) {
   char* c = (char*)malloc(value.length());
@@ -28,6 +52,11 @@ const char* CopyString(const std::string& value) {
 // ToCString extracts a C string from a V8 Utf8Value.
 const char* ToCString(const String::Utf8Value& value) {
   return *value ? *value : "<v8worker: string conversion failed>";
+}
+
+std::string ToStdString(Isolate* isolate, Local<String> value) {
+  String::Utf8Value utf8(isolate, value);
+  return *utf8;
 }
 
 // ExceptionString gathers details about the latest Exception.
@@ -91,8 +120,65 @@ std::string ExceptionString(Isolate* isolate,
   return out;
 }
 
+ModuleData* GetModuleData(Local<Context> context) {
+  return static_cast<ModuleData*>(
+      context->GetAlignedPointerFromEmbedderData(1));
+}
+
+void InitModuleData(Local<Context> context) {
+  context->SetAlignedPointerInEmbedderData(
+      1, new ModuleData(context->GetIsolate()));
+}
+
+MaybeLocal<Module> ResolveModuleCallback(Local<Context> context,
+                                         Local<String> url,
+                                         Local<Module> referrer) {
+  Isolate* isolate = context->GetIsolate();
+  ModuleData* d = GetModuleData(context);
+  std::string url_str = ToStdString(isolate, url);
+  auto module_it = d->url_to_module_map.find(url_str);
+  return module_it->second.Get(isolate);
+}
+
 extern "C" {
 #include "_cgo_export.h"
+
+void LoadModule(worker* w,
+                Local<Context> context,
+                Local<String> url,
+                MaybeLocal<Module>& mod) {
+  ScriptOrigin origin(url, Local<Integer>(), Local<Integer>(), Local<Boolean>(),
+                      Local<Integer>(), Local<Value>(), Local<Boolean>(),
+                      Local<Boolean>(), True(w->isolate));
+
+  std::string url_str = ToStdString(w->isolate, url);
+  char* source_str = getModuleSource(w->id, (char*)url_str.c_str());
+  Local<String> source_text = String::NewFromUtf8(w->isolate, source_str);
+  ScriptCompiler::Source source(source_text, origin);
+
+  Local<Module> module;
+  if (!ScriptCompiler::CompileModule(w->isolate, &source).ToLocal(&module)) {
+    return;
+  }
+
+  ModuleData* d = GetModuleData(context);
+  d->url_to_module_map.insert(
+      std::make_pair(url_str, Global<Module>(w->isolate, module)));
+  d->module_to_url_map.insert(
+      std::make_pair(Global<Module>(w->isolate, module), url_str));
+
+  for (int i = 0, length = module->GetModuleRequestsLength(); i < length; ++i) {
+    Local<String> name = module->GetModuleRequest(i);
+    MaybeLocal<Module> submodule;
+    LoadModule(w, context, name, submodule);
+    if (submodule.IsEmpty()) {
+      return;
+    }
+  }
+
+  mod = module;
+  return;
+}
 
 // The $print function.
 void Print(const FunctionCallbackInfo<Value>& args) {
@@ -170,7 +256,7 @@ void Send(const FunctionCallbackInfo<Value>& args) {
     msg = ToCString(str);
   }
   // TODO(tav): should we use Unlocker?
-  recvCb((char*)msg.c_str(), w->id);
+  recvCb(w->id, (char*)msg.c_str());
 }
 
 // The $sendSync function. Calls the corresponding worker's SyncCallback in Go.
@@ -194,7 +280,7 @@ void SendSync(const FunctionCallbackInfo<Value>& args) {
     String::Utf8Value str(v);
     msg = ToCString(str);
   }
-  char* returnMsg = recvSyncCb((char*)msg.c_str(), w->id);
+  char* returnMsg = recvSyncCb(w->id, (char*)msg.c_str());
   Local<String> returnV = String::NewFromUtf8(w->isolate, returnMsg);
   args.GetReturnValue().Set(returnV);
   free(returnMsg);
@@ -215,7 +301,43 @@ const char* worker_last_exception(worker* w) {
   return CopyString(w->last_exception);
 }
 
-int worker_load(worker* w, char* name_s, char* source_s) {
+int worker_load_module(worker* w, char* url_s) {
+  Locker locker(w->isolate);
+  Isolate::Scope isolate_scope(w->isolate);
+  HandleScope handle_scope(w->isolate);
+
+  Local<Context> context = Local<Context>::New(w->isolate, w->context);
+  Context::Scope context_scope(context);
+  TryCatch try_catch(w->isolate);
+
+  Local<String> url = String::NewFromUtf8(w->isolate, url_s);
+  MaybeLocal<Module> mod;
+  LoadModule(w, context, url, mod);
+
+  Local<Module> module;
+  if (!mod.ToLocal(&module)) {
+    w->last_exception = ExceptionString(w->isolate, context, &try_catch);
+    return 1;
+  }
+
+  MaybeLocal<Value> maybe_result;
+  if (!module->InstantiateModule(context, ResolveModuleCallback)
+           .FromMaybe(false)) {
+    w->last_exception = ExceptionString(w->isolate, context, &try_catch);
+    return 2;
+  }
+
+  maybe_result = module->Evaluate(context);
+  Local<Value> result;
+  if (!maybe_result.ToLocal(&result)) {
+    w->last_exception = ExceptionString(w->isolate, context, &try_catch);
+    return 3;
+  }
+
+  return 0;
+}
+
+int worker_load_script(worker* w, char* name_s, char* source_s) {
   Locker locker(w->isolate);
   Isolate::Scope isolate_scope(w->isolate);
   HandleScope handle_scope(w->isolate);
@@ -249,7 +371,7 @@ int worker_load(worker* w, char* name_s, char* source_s) {
   return 0;
 }
 
-worker* worker_new(int id) {
+worker* worker_init(int id, int enable_print) {
   worker* w = new (worker);
 
   Isolate::CreateParams create_params;
@@ -267,8 +389,10 @@ worker* worker_new(int id) {
 
   Local<ObjectTemplate> global = ObjectTemplate::New(w->isolate);
 
-  global->Set(String::NewFromUtf8(w->isolate, "$print"),
-              FunctionTemplate::New(w->isolate, Print));
+  if (enable_print) {
+    global->Set(String::NewFromUtf8(w->isolate, "$print"),
+                FunctionTemplate::New(w->isolate, Print));
+  }
 
   global->Set(String::NewFromUtf8(w->isolate, "$recv"),
               FunctionTemplate::New(w->isolate, Recv));
@@ -285,6 +409,7 @@ worker* worker_new(int id) {
   Local<Context> context = Context::New(w->isolate, NULL, global);
   w->context.Reset(w->isolate, context);
 
+  InitModuleData(context);
   return w;
 }
 

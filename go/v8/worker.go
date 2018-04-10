@@ -28,35 +28,44 @@ var registry = make(map[int32]*instance)
 // Internal struct which is stored in the registry map using the weakref
 // pattern.
 type instance struct {
-	cb     func(string)
-	id     int32
-	syncCb func(string) string
-	worker *C.worker
+	getModuleSource func(string) (string, error)
+	handleSend      func(string) error
+	handleSendSync  func(string) (string, error)
+	id              int32
+	worker          *C.worker
 }
 
 // Worker represents a single JavaScript VM instance.
 //
 // The various configuration options must be set before any of that Worker's
 // methods are called. Once one of its methods has been called, the Worker will
-// no longer pay any attention to changes in the configuration options.
+// no longer pay any attention to changes in its config.
 type Worker struct {
 	instance *instance
 	mutex    sync.Mutex
 
-	// GetModuleSource is used to get
-	GetModuleSource func(url string) string
+	// EnablePrint creates the debug $print function in the JavaScript global
+	// scope.
+	EnablePrint bool
+
+	// GetModuleSource returns the source code when given the fully qualified
+	// url of a module, or returns an error if it couldn't retrieve the source
+	// code for some reason.
+	GetModuleSource func(url string) (source string, err error)
 
 	// HandleSend handles messages received from js.send calls. If it is nil,
 	// then an exception will be raised to the caller.
-	HandleSend func(msg string)
+	HandleSend func(msg string) error
 
 	// HandleSendSync handles messages received from js.sendSync calls. Its
 	// return value will be passed back to the caller in JavaScript. If
 	// HandleSendSync is nil, then an exception will be raised to the caller.
-	HandleSendSync func(msg string) (response string)
+	HandleSendSync func(msg string) (response string, err error)
 
-	// ResolveModuleURL
-	ResolveModuleURL func(url string, context string) string
+	// ResolveModuleURL resolves the url of a module relative to the module it
+	// was imported from and returns the fully qualified url of the module, or
+	// an error if no such module could be found.
+	ResolveModuleURL func(url string, importer string) (string, error)
 }
 
 // Version returns the V8 version, e.g. "6.6.346.19".
@@ -72,27 +81,40 @@ func getInstance(id int32) *instance {
 	return registry[id]
 }
 
+//export getModuleSource
+func getModuleSource(id int32, url *C.char) *C.char {
+	get := getInstance(id).getModuleSource
+	if get == nil {
+		panic("Worker.GetModuleSource not set")
+	}
+	source, err := get(C.GoString(url))
+	if err != nil {
+		panic(err)
+	}
+	return C.CString(source)
+}
+
 //export recvCb
-func recvCb(msg *C.char, id int32) {
-	cb := getInstance(id).cb
+func recvCb(id int32, msg *C.char) {
+	cb := getInstance(id).handleSend
 	if cb != nil {
 		cb(C.GoString(msg))
 	}
 }
 
 //export recvSyncCb
-func recvSyncCb(msg *C.char, id int32) *C.char {
-	syncCb := getInstance(id).syncCb
+func recvSyncCb(id int32, msg *C.char) *C.char {
+	cb := getInstance(id).handleSendSync
 	var resp string
-	if syncCb == nil {
+	if cb == nil {
 		resp = "v8: Worker.HandleSendSync is nil"
 	} else {
-		resp = syncCb(C.GoString(msg))
+		resp, _ = cb(C.GoString(msg))
 	}
 	return C.CString(resp)
 }
 
-// Free resources associated with the underlying worker and V8 Isolate.
+// Free resources associated with the underlying instance and V8 Isolate.
 func (w *Worker) dispose() {
 	mutex.Lock()
 	delete(registry, w.instance.id)
@@ -116,9 +138,10 @@ func (w *Worker) init() {
 	mutex.Lock()
 	nextID++
 	i := &instance{
-		cb:     w.HandleSend,
-		id:     nextID,
-		syncCb: w.HandleSendSync,
+		getModuleSource: w.GetModuleSource,
+		handleSend:      w.HandleSend,
+		handleSendSync:  w.HandleSendSync,
+		id:              nextID,
 	}
 	registry[nextID] = i
 	mutex.Unlock()
@@ -127,7 +150,12 @@ func (w *Worker) init() {
 		C.v8_init()
 	})
 
-	i.worker = C.worker_new(C.int(i.id))
+	var enablePrint int32
+	if w.EnablePrint {
+		enablePrint = 1
+	}
+
+	i.worker = C.worker_init(C.int(i.id), C.int(enablePrint))
 	w.instance = i
 
 	runtime.SetFinalizer(w, func(w *Worker) {
@@ -135,19 +163,17 @@ func (w *Worker) init() {
 	})
 }
 
-// LoadModule loads and executes JavaScript ES Module code with the given
-// filename and source code. LoadModule is not threadsafe.
-func (w *Worker) LoadModule(url string, source string) error {
+// LoadModule loads and executes ES Module code with the given url. LoadModule
+// is not threadsafe.
+func (w *Worker) LoadModule(url string) error {
 	w.mutex.Lock()
 	w.init()
 	w.mutex.Unlock()
 
 	urlStr := C.CString(url)
-	sourceStr := C.CString(source)
 	defer C.free(unsafe.Pointer(urlStr))
-	defer C.free(unsafe.Pointer(sourceStr))
 
-	r := C.worker_load_module(w.instance.worker, urlStr, sourceStr)
+	r := C.worker_load_module(w.instance.worker, urlStr)
 	if r != 0 {
 		return w.getError()
 	}
@@ -191,7 +217,7 @@ func (w *Worker) Send(msg string) error {
 
 // SendSync sends a message, calling the $recvSync callback in JavaScript. The
 // return value of that callback will be passed back to the caller in Go.
-func (w *Worker) SendSync(msg string) string {
+func (w *Worker) SendSync(msg string) (string, error) {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
 
@@ -202,7 +228,7 @@ func (w *Worker) SendSync(msg string) string {
 	resp := C.worker_send_sync(w.instance.worker, msgStr)
 	defer C.free(unsafe.Pointer(resp))
 
-	return C.GoString(resp)
+	return C.GoString(resp), nil
 }
 
 // Terminate instructs the underlying JavaScript VM to stop its current thread
