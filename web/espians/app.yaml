@@ -1,0 +1,18 @@
+# Public Domain (-) 2018-present, The Espian Source Authors.
+# See the Espian Source UNLICENSE file for details.
+
+runtime: go
+api_version: go1
+
+handlers:
+
+  - url: /.static/logo.png
+    static_files: static/logo.png
+    upload: static/logo.png
+
+  - url: /.static/map.svg
+    static_files: static/map.svg
+    upload: static/map.svg
+
+  - url: /.*
+    script: _go_app
