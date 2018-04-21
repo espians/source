@@ -83,11 +83,7 @@ func getInstance(id int32) *instance {
 
 //export getModuleSource
 func getModuleSource(id int32, url *C.char) *C.char {
-	get := getInstance(id).getModuleSource
-	if get == nil {
-		panic("Worker.GetModuleSource not set")
-	}
-	source, err := get(C.GoString(url))
+	source, err := getInstance(id).getModuleSource(C.GoString(url))
 	if err != nil {
 		panic(err)
 	}
@@ -168,6 +164,9 @@ func (w *Worker) init() {
 func (w *Worker) LoadModule(url string) error {
 	w.mutex.Lock()
 	w.init()
+	if w.instance.getModuleSource == nil {
+		return errors.New("v8: GetModuleSource needs to be set before any methods are called")
+	}
 	w.mutex.Unlock()
 
 	urlStr := C.CString(url)
@@ -243,3 +242,13 @@ func (w *Worker) Terminate() {
 		C.worker_terminate_execution(w.instance.worker)
 	}
 }
+
+// TODO:
+//
+// Configure module resolution
+// Fully fledged error values
+// Raise exceptions in JS
+// Return errors in Go
+// Protect $functions -- perhaps in module -- perhaps make it configurable
+// Handle async
+// Set request/response IDs

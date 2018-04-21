@@ -287,6 +287,8 @@ void SendSync(const FunctionCallbackInfo<Value>& args) {
 }
 
 void v8_init() {
+  const char* options = "--harmony_public_fields --harmony_private_fields";
+  V8::SetFlagsFromString(options, strlen(options));
   Platform* platform = platform::CreateDefaultPlatform();
   V8::InitializePlatform(platform);
   V8::Initialize();
