@@ -25,7 +25,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`<!doctype html>
 <meta charset=utf-8>
 <title>Espians</title>
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <script async src="https://www.googletagmanager.com/gtag/js?id=UA-90176-9"></script>
 <script>
   dataLayer = [];
@@ -33,7 +33,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
   gtag('js', new Date());
   gtag('config', 'UA-90176-9');
 </script>
-<link rel="stylesheet" href="//fonts.googleapis.com/css?family=Montserrat|Raleway">
+<link rel="stylesheet" href="//fonts.googleapis.com/css?family=Montserrat%7CRaleway">
 <style>
 html {
 	margin: 0;
