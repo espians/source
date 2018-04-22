@@ -1,0 +1,10 @@
+# Public Domain (-) 2018-present, The Espian Source Authors.
+# See the Espian Source UNLICENSE file for details.
+
+runtime: go
+api_version: go1
+
+handlers:
+
+  - url: /.*
+    script: _go_app
