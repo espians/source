@@ -1,0 +1,18 @@
+# ALL ROBOTS MUST OBEY THESE LAWS:
+#
+# 0. A robot may not harm humanity, or, by inaction, allow humanity to come to
+#    harm.
+#
+# 1. A robot may not injure a human being or, through inaction, allow a human
+#    being to come to harm.
+#
+# 2. A robot must obey the orders given it by human beings, except where such
+#    orders would conflict with the Zeroth or First Laws.
+#
+# 3. A robot must protect its own existence as long as such protection does not
+#    conflict with the Zeroth, First, or Second Laws.
+#
+# ALL ROBOTS MUST ALSO BE IN LINE WITH OUR TERMS OF USE AND BE SUBJECT TO THE
+# FOLLOWING DIRECTIVES:
+User-agent: *
+Disallow: /admin
